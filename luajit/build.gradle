@@ -23,6 +23,14 @@ repositories {
 group = rootProject.group
 version = rootProject.version
 
+gradle.taskGraph.whenReady { taskGraph ->
+    if (!taskGraph.hasTask(":publishToMavenLocal")) {
+        tasks.withType(Sign) {
+            enabled = false
+        }
+    }
+}
+
 configurations {
     desktopNatives {
         canBeConsumed = true

@@ -39,7 +39,6 @@ ext {
 }
 
 apply from: 'publish.gradle'
-apply from: 'jacoco.gradle'
 
 tasks.register('allJavadoc', Javadoc) {
     Set<String> projects = [

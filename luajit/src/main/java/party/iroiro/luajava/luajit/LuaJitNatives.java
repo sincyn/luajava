@@ -22,6 +22,11 @@
 
 package party.iroiro.luajava.luajit;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.*;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.nio.Buffer;
 
@@ -96,47 +101,139 @@ import party.iroiro.luajava.util.GlobalLibraryLoader;
  */
 @SuppressWarnings({"unused", "rawtypes"})
 public class LuaJitNatives implements LuaNatives {
-        /*JNI
-            #include "luacustomamalg.h"
-
-            #include "lua.hpp"
-            #include "jni.h"
-
-            #include "jua.h"
-
-            #include "luacomp.h"
-
-            #include "juaapi.h"
-            #include "jualib.h"
-            #include "juaamalg.h"
-
-            #include "luacustom.h"
-         */
+    private static final String LIB_NAME_DEFAULT = "luajit";
+    private static final String LIB_NAME_PROP = "luajit.libname";
+    private static final String LIB_PATH_PROP = "luajit.libpath";
+    private static final String LIB_TMP_DIR_PREFIX = "luajit-native-";
 
     private final static AtomicReference<String> loaded = new AtomicReference<>(null);
 
-    protected LuaJitNatives() throws IllegalStateException {
-        synchronized (loaded) {
-            if (loaded.get() != null) { return; }
-            try {
-                GlobalLibraryLoader.register(LuaJitNatives.class, false);
-                String file = GlobalLibraryLoader.load("luajit");
-                if (initBindings() != 0) {
-                    throw new RuntimeException("Unable to init bindings");
+    static {
+        try {
+            final String libPath = System.getProperty(LIB_PATH_PROP);
+            final String libName = System.getProperty(LIB_NAME_PROP, LIB_NAME_DEFAULT);
+            final String fullLibName = resolveFullLibName();
+
+            String loadedPath = null;
+            System.out.println("Trying to load library: " + fullLibName);
+
+            if (libPath != null) {
+                loadedPath = Paths.get(libPath).resolve(fullLibName).toAbsolutePath().toString();
+                System.load(loadedPath);
+            } else {
+                try {
+                    System.loadLibrary(libName);
+                    loadedPath = libName;
+                } catch (Exception | Error e) {
+                    final String extractedLibAbsPath = tryLoadFromClasspath(fullLibName);
+                    if (extractedLibAbsPath != null) {
+                        System.load(extractedLibAbsPath);
+                        loadedPath = extractedLibAbsPath;
+                    } else {
+                        throw e;
+                    }
                 }
-                loaded.set(file);
-            } catch (Throwable e) {
-                throw new IllegalStateException(e);
+            }
+
+            if (initBindings() != 0) {
+                throw new RuntimeException("Unable to init bindings");
+            }
+
+            loaded.set(loadedPath);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load LuaJit native library", e);
+        }
+    }
+
+    protected LuaJitNatives() throws IllegalStateException {
+        if (loaded.get() == null) {
+            throw new IllegalStateException("LuaJit native library not loaded");
+        }
+    }
+
+    private static String resolveFullLibName() {
+        final boolean isWin = System.getProperty("os.name").toLowerCase().contains("win");
+        final boolean isMac = System.getProperty("os.name").toLowerCase().contains("mac");
+        final String arch = System.getProperty("os.arch").toLowerCase();
+        final boolean isArm = arch.contains("arm") || arch.contains("aarch64");
+        final String libPrefix;
+        final String libSuffix;
+        final String archSuffix;
+
+        if (isWin) {
+            libPrefix = "";
+            libSuffix = ".dll";
+            archSuffix = arch.contains("64") ? "64" : "32";
+        } else if (isMac) {
+            libPrefix = "lib";
+            libSuffix = ".dylib";
+            archSuffix = (arch.contains("64") ? "64" : "");
+        } else {
+            libPrefix = "lib";
+            libSuffix = ".so";
+            archSuffix = arch.contains("64") ? "64" : "";
+        }
+
+        String baseName = System.getProperty(LIB_NAME_PROP, LIB_NAME_DEFAULT);
+        if (isMac && isArm) {
+            baseName += "arm";
+        }
+
+        return libPrefix + baseName + archSuffix + libSuffix;
+    }
+
+    private static String tryLoadFromClasspath(final String fullLibName) {
+        String[] potentialPaths = {
+                "native/" + System.getProperty("os.arch").toLowerCase() + "/" + fullLibName,
+                "native/" + fullLibName
+        };
+
+        for (String path : potentialPaths) {
+            //The class loader for the current thread
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) {
+                cl = LuaJitNatives.class.getClassLoader();
+            }
+            try (InputStream is = cl.getResourceAsStream("/" + path)) {
+                if (is == null) continue;
+
+                final String version = getVersionString().orElse("undefined");
+                final Path tmpDir = Paths.get(System.getProperty("java.io.tmpdir")).resolve(LIB_TMP_DIR_PREFIX).resolve(version);
+                if (!Files.exists(tmpDir)) {
+                    Files.createDirectories(tmpDir);
+                }
+
+                final Path libBin = tmpDir.resolve(fullLibName);
+                try {
+                    Files.copy(is, libBin, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AccessDeniedException e) {
+                    if (!Files.exists(libBin)) {
+                        throw e;
+                    }
+                }
+
+                return libBin.toAbsolutePath().toString();
+            } catch (IOException e) {
+                // Log the exception or print it for debugging
+                e.printStackTrace();
             }
         }
+
+        return null;
+    }
+
+    private static Optional<String> getVersionString() {
+        // Implement version string retrieval logic here
+        // This could be reading from a properties file or a constant in the code
+        return Optional.of("1.0.0"); // Placeholder
     }
 
     /**
      * Exposes the symbols in the natives to external libraries.
      *
      * <p>
-     *     Users are only allowed load one instance of natives if they want it global.
-     *     Otherwise, the JVM might just crash due to identical symbol names in different binaries.
+     * Users are only allowed load one instance of natives if they want it global.
+     * Otherwise, the JVM might just crash due to identical symbol names in different binaries.
      * </p>
      */
     public void loadAsGlobal() {
@@ -178,7 +275,7 @@ public class LuaJitNatives implements LuaNatives {
      * it is left unchanged.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param extra extra slots
      * @return see description
      */
@@ -244,7 +341,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param n the number of elements
+     * @param n   the number of elements
      */
     public native void lua_concat(long ptr, int n); /*
         lua_State * L = (lua_State *) ptr;
@@ -273,7 +370,7 @@ public class LuaJitNatives implements LuaNatives {
      * Otherwise you can use the function <a href="https://www.lua.org/manual/5.1/manual.html#lua_newtable"><code>lua_newtable</code></a>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param narr the number of pre-allocated array elements
      * @param nrec the number of pre-allocated non-array elements
      */
@@ -304,7 +401,7 @@ public class LuaJitNatives implements LuaNatives {
      * Also returns&#160;0 if any of the indices is non valid.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param index1 the stack position of the first element
      * @param index2 the stack position of the second element
      * @return see description
@@ -423,7 +520,7 @@ public class LuaJitNatives implements LuaNatives {
      *
      * </ul>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param what what
      * @param data data
      * @return see description
@@ -452,7 +549,7 @@ public class LuaJitNatives implements LuaNatives {
      * the value at the given index.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_getfenv(long ptr, int index); /*
@@ -480,9 +577,9 @@ public class LuaJitNatives implements LuaNatives {
      * for the "index" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param k the field name
+     * @param k     the field name
      */
     public native void lua_getfield(long ptr, int index, String k); /*
         lua_State * L = (lua_State *) ptr;
@@ -509,9 +606,9 @@ public class LuaJitNatives implements LuaNatives {
      * for the "index" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param k the field name
+     * @param k     the field name
      */
     public native void luaJ_getfield(long ptr, int index, String k); /*
         lua_State * L = (lua_State *) ptr;
@@ -540,7 +637,7 @@ public class LuaJitNatives implements LuaNatives {
      *      #define lua_getglobal(L,s)  lua_getfield(L, LUA_GLOBALSINDEX, s)
      * </pre>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param name the name
      */
     public native void lua_getglobal(long ptr, String name); /*
@@ -570,7 +667,7 @@ public class LuaJitNatives implements LuaNatives {
      *      #define lua_getglobal(L,s)  lua_getfield(L, LUA_GLOBALSINDEX, s)
      * </pre>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param name the name
      */
     public native void luaJ_getglobal(long ptr, String name); /*
@@ -599,7 +696,7 @@ public class LuaJitNatives implements LuaNatives {
      * the function returns&#160;0 and pushes nothing on the stack.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -635,7 +732,7 @@ public class LuaJitNatives implements LuaNatives {
      * for the "index" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_gettable(long ptr, int index); /*
@@ -669,7 +766,7 @@ public class LuaJitNatives implements LuaNatives {
      * for the "index" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void luaJ_gettable(long ptr, int index); /*
@@ -726,7 +823,7 @@ public class LuaJitNatives implements LuaNatives {
      * because a pseudo-index is not an actual stack position.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_insert(long ptr, int index); /*
@@ -752,7 +849,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -780,7 +877,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -808,7 +905,7 @@ public class LuaJitNatives implements LuaNatives {
      * (either C or Lua), and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -836,7 +933,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -864,7 +961,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -893,7 +990,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -923,7 +1020,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -952,7 +1049,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -981,7 +1078,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1009,7 +1106,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1037,7 +1134,7 @@ public class LuaJitNatives implements LuaNatives {
      * and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1065,7 +1162,7 @@ public class LuaJitNatives implements LuaNatives {
      * (either full or light), and 0&#160;otherwise.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1097,7 +1194,7 @@ public class LuaJitNatives implements LuaNatives {
      * Also returns&#160;0 if any of the indices is non valid.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param index1 the stack position of the first element
      * @param index2 the stack position of the second element
      * @return see description
@@ -1204,7 +1301,7 @@ public class LuaJitNatives implements LuaNatives {
      * Lua frees its corresponding memory.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param size size
      * @return see description
      */
@@ -1261,7 +1358,7 @@ public class LuaJitNatives implements LuaNatives {
      * this confuses the next call to <a href="https://www.lua.org/manual/5.1/manual.html#lua_next"><code>lua_next</code></a>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1293,7 +1390,7 @@ public class LuaJitNatives implements LuaNatives {
      * for other values, it is&#160;0.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -1379,10 +1476,10 @@ public class LuaJitNatives implements LuaNatives {
      *
      * </ul>
      *
-     * @param ptr the <code>lua_State*</code> pointer
-     * @param nargs the number of arguments that you pushed onto the stack
+     * @param ptr      the <code>lua_State*</code> pointer
+     * @param nargs    the number of arguments that you pushed onto the stack
      * @param nresults the number of results, or <code>LUA_MULTRET</code>
-     * @param errfunc 0 or the stack index of an error handler function
+     * @param errfunc  0 or the stack index of an error handler function
      * @return see description
      */
     public native int lua_pcall(long ptr, int nargs, int nresults, int errfunc); /*
@@ -1409,7 +1506,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param n the number of elements
+     * @param n   the number of elements
      */
     public native void lua_pop(long ptr, int n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1434,7 +1531,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param b boolean
+     * @param b   boolean
      */
     public native void lua_pushboolean(long ptr, int b); /*
         lua_State * L = (lua_State *) ptr;
@@ -1459,7 +1556,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param n the number / the number of elements
+     * @param n   the number / the number of elements
      */
     public native void lua_pushinteger(long ptr, long n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1508,7 +1605,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param p the pointer
+     * @param p   the pointer
      */
     public native void lua_pushlightuserdata(long ptr, long p); /*
         lua_State * L = (lua_State *) ptr;
@@ -1557,7 +1654,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param n the number / the number of elements
+     * @param n   the number / the number of elements
      */
     public native void lua_pushnumber(long ptr, double n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1588,7 +1685,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param s the string
+     * @param s   the string
      */
     public native void lua_pushstring(long ptr, String s); /*
         lua_State * L = (lua_State *) ptr;
@@ -1619,7 +1716,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param s the string
+     * @param s   the string
      */
     public native void luaJ_pushstring(long ptr, String s); /*
         lua_State * L = (lua_State *) ptr;
@@ -1671,7 +1768,7 @@ public class LuaJitNatives implements LuaNatives {
      * onto the stack.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_pushvalue(long ptr, int index); /*
@@ -1700,7 +1797,7 @@ public class LuaJitNatives implements LuaNatives {
      * Also returns&#160;0 if any of the indices are non valid.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param index1 the stack position of the first element
      * @param index2 the stack position of the second element
      * @return see description
@@ -1729,7 +1826,7 @@ public class LuaJitNatives implements LuaNatives {
      * (i.e., without metamethods).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_rawget(long ptr, int index); /*
@@ -1755,7 +1852,7 @@ public class LuaJitNatives implements LuaNatives {
      * (i.e., without metamethods).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void luaJ_rawget(long ptr, int index); /*
@@ -1783,9 +1880,9 @@ public class LuaJitNatives implements LuaNatives {
      * that is, it does not invoke metamethods.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param n the number of elements
+     * @param n     the number of elements
      */
     public native void lua_rawgeti(long ptr, int index, int n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1812,9 +1909,9 @@ public class LuaJitNatives implements LuaNatives {
      * that is, it does not invoke metamethods.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param n the number of elements
+     * @param n     the number of elements
      */
     public native void luaJ_rawgeti(long ptr, int index, int n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1839,7 +1936,7 @@ public class LuaJitNatives implements LuaNatives {
      * (i.e., without metamethods).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_rawset(long ptr, int index); /*
@@ -1872,9 +1969,9 @@ public class LuaJitNatives implements LuaNatives {
      * that is, it does not invoke metamethods.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param n the number of elements
+     * @param n     the number of elements
      */
     public native void lua_rawseti(long ptr, int index, int n); /*
         lua_State * L = (lua_State *) ptr;
@@ -1901,7 +1998,7 @@ public class LuaJitNatives implements LuaNatives {
      * because a pseudo-index is not an actual stack position.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_remove(long ptr, int index); /*
@@ -1928,7 +2025,7 @@ public class LuaJitNatives implements LuaNatives {
      * (therefore replacing the value at the given position).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_replace(long ptr, int index); /*
@@ -1976,7 +2073,7 @@ public class LuaJitNatives implements LuaNatives {
      * and then call <a href="https://www.lua.org/manual/5.1/manual.html#lua_resume"><code>lua_resume</code></a>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param narg the number of arguments
      * @return see description
      */
@@ -2008,7 +2105,7 @@ public class LuaJitNatives implements LuaNatives {
      * Otherwise it returns 1.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2043,9 +2140,9 @@ public class LuaJitNatives implements LuaNatives {
      * for the "newindex" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
-     * @param k the field name
+     * @param k     the field name
      */
     public native void lua_setfield(long ptr, int index, String k); /*
         lua_State * L = (lua_State *) ptr;
@@ -2075,7 +2172,7 @@ public class LuaJitNatives implements LuaNatives {
      *      #define lua_setglobal(L,s)   lua_setfield(L, LUA_GLOBALSINDEX, s)
      * </pre>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param name the name
      */
     public native void lua_setglobal(long ptr, String name); /*
@@ -2102,7 +2199,7 @@ public class LuaJitNatives implements LuaNatives {
      * acceptable index.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2131,7 +2228,7 @@ public class LuaJitNatives implements LuaNatives {
      * acceptable index.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void luaJ_setmetatable(long ptr, int index); /*
@@ -2165,7 +2262,7 @@ public class LuaJitNatives implements LuaNatives {
      * for the "newindex" event (see <a href="https://www.lua.org/manual/5.1/manual.html#2.8">&#167;2.8</a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_settable(long ptr, int index); /*
@@ -2194,7 +2291,7 @@ public class LuaJitNatives implements LuaNatives {
      * If <code>index</code> is&#160;0, then all stack elements are removed.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      */
     public native void lua_settop(long ptr, int index); /*
@@ -2259,7 +2356,7 @@ public class LuaJitNatives implements LuaNatives {
      * use <a href="https://www.lua.org/manual/5.1/manual.html#lua_isboolean"><code>lua_isboolean</code></a> to test the value's type.)
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2295,7 +2392,7 @@ public class LuaJitNatives implements LuaNatives {
      * it is truncated in some non-specified way.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2329,7 +2426,7 @@ public class LuaJitNatives implements LuaNatives {
      * otherwise, <a href="https://www.lua.org/manual/5.1/manual.html#lua_tonumber"><code>lua_tonumber</code></a> returns&#160;0.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2365,7 +2462,7 @@ public class LuaJitNatives implements LuaNatives {
      * Typically this function is used only for debug information.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2392,7 +2489,7 @@ public class LuaJitNatives implements LuaNatives {
      * Equivalent to <a href="https://www.lua.org/manual/5.1/manual.html#lua_tolstring"><code>lua_tolstring</code></a> with <code>len</code> equal to <code>NULL</code>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2422,7 +2519,7 @@ public class LuaJitNatives implements LuaNatives {
      * otherwise, the function returns <code>NULL</code>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2453,7 +2550,7 @@ public class LuaJitNatives implements LuaNatives {
      * Otherwise, returns <code>NULL</code>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2494,7 +2591,7 @@ public class LuaJitNatives implements LuaNatives {
      * <code>LUA_TLIGHTUSERDATA</code>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -2523,7 +2620,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param tp type id
+     * @param tp  type id
      * @return see description
      */
     public native String lua_typename(long ptr, int tp); /*
@@ -2555,8 +2652,8 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param from a thread
-     * @param to another thread
-     * @param n the number of elements
+     * @param to   another thread
+     * @param n    the number of elements
      */
     public native void lua_xmove(long from, long to, int n); /*
         lua_xmove((lua_State *) from, (lua_State *) to, (int) n);
@@ -2595,7 +2692,7 @@ public class LuaJitNatives implements LuaNatives {
      * that are passed as results to <a href="https://www.lua.org/manual/5.1/manual.html#lua_resume"><code>lua_resume</code></a>.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr      the <code>lua_State*</code> pointer
      * @param nresults the number of results, or <code>LUA_MULTRET</code>
      * @return see description
      */
@@ -2691,9 +2788,9 @@ public class LuaJitNatives implements LuaNatives {
      * as a name for all upvalues.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr       the <code>lua_State*</code> pointer
      * @param funcindex the stack position of the closure
-     * @param n the index in the upvalue
+     * @param n         the index in the upvalue
      * @return see description
      */
     public native String lua_getupvalue(long ptr, int funcindex, int n); /*
@@ -2729,9 +2826,9 @@ public class LuaJitNatives implements LuaNatives {
      * when the index is greater than the number of upvalues.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr       the <code>lua_State*</code> pointer
      * @param funcindex the stack position of the closure
-     * @param n the index in the upvalue
+     * @param n         the index in the upvalue
      * @return see description
      */
     public native String lua_setupvalue(long ptr, int funcindex, int n); /*
@@ -2769,7 +2866,7 @@ public class LuaJitNatives implements LuaNatives {
      *
      * @param ptr the <code>lua_State*</code> pointer
      * @param obj the stack position of the object
-     * @param e field name
+     * @param e   field name
      * @return see description
      */
     public native int luaL_callmeta(long ptr, int obj, String e); /*
@@ -2838,7 +2935,7 @@ public class LuaJitNatives implements LuaNatives {
      *
      * @param ptr the <code>lua_State*</code> pointer
      * @param obj the stack position of the object
-     * @param e field name
+     * @param e   field name
      * @return see description
      */
     public native int luaL_getmetafield(long ptr, int obj, String e); /*
@@ -2865,7 +2962,7 @@ public class LuaJitNatives implements LuaNatives {
      * in the registry (see <a href="https://www.lua.org/manual/5.1/manual.html#luaL_newmetatable"><code>luaL_newmetatable</code></a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param tname type name
      */
     public native void luaL_getmetatable(long ptr, String tname); /*
@@ -2891,7 +2988,7 @@ public class LuaJitNatives implements LuaNatives {
      * in the registry (see <a href="https://www.lua.org/manual/5.1/manual.html#luaL_newmetatable"><code>luaL_newmetatable</code></a>).
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param tname type name
      */
     public native void luaJ_getmetatable(long ptr, String tname); /*
@@ -2923,9 +3020,9 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param s the string
-     * @param p the replaced sequence
-     * @param r the replacing string
+     * @param s   the string
+     * @param p   the replaced sequence
+     * @param r   the replacing string
      * @return see description
      */
     public native String luaL_gsub(long ptr, String s, String p, String r); /*
@@ -2963,7 +3060,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param s the string
+     * @param s   the string
      * @return see description
      */
     public native int luaL_loadstring(long ptr, String s); /*
@@ -2999,7 +3096,7 @@ public class LuaJitNatives implements LuaNatives {
      * with <code>tname</code> in the registry.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param tname type name
      * @return see description
      */
@@ -3104,7 +3201,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param t the stack index
+     * @param t   the stack index
      * @return see description
      */
     public native int luaL_ref(long ptr, int t); /*
@@ -3130,7 +3227,7 @@ public class LuaJitNatives implements LuaNatives {
      * Returns the name of the type of the value at the given index.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3167,8 +3264,8 @@ public class LuaJitNatives implements LuaNatives {
      * and <code><em>rt</em></code> is the type name of the actual argument.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
-     * @param narg the number of arguments
+     * @param ptr   the <code>lua_State*</code> pointer
+     * @param narg  the number of arguments
      * @param tname type name
      * @return see description
      */
@@ -3205,7 +3302,7 @@ public class LuaJitNatives implements LuaNatives {
      * </p>
      *
      * @param ptr the <code>lua_State*</code> pointer
-     * @param t the stack index
+     * @param t   the stack index
      * @param ref the reference
      */
     public native void luaL_unref(long ptr, int t, int ref); /*
@@ -3280,10 +3377,10 @@ public class LuaJitNatives implements LuaNatives {
      * See <code>lua_compare</code>
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param index1 the stack position of the first element
      * @param index2 the stack position of the second element
-     * @param op the operator
+     * @param op     the operator
      * @return see description
      */
     public native int luaJ_compare(long ptr, int index1, int index2, int op); /*
@@ -3301,7 +3398,7 @@ public class LuaJitNatives implements LuaNatives {
      * Wrapper of <code>lua_(obj)len</code>
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3320,10 +3417,10 @@ public class LuaJitNatives implements LuaNatives {
      * Load a direct buffer
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param buffer the buffer (expecting direct)
-     * @param size size
-     * @param name the name
+     * @param size   size
+     * @param name   the name
      * @return see description
      */
     public native int luaJ_loadbuffer(long ptr, Buffer buffer, int size, String name); /*
@@ -3341,10 +3438,10 @@ public class LuaJitNatives implements LuaNatives {
      * Run a direct buffer
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr    the <code>lua_State*</code> pointer
      * @param buffer the buffer (expecting direct)
-     * @param size size
-     * @param name the name
+     * @param size   size
+     * @param name   the name
      * @return see description
      */
     public native int luaJ_dobuffer(long ptr, Buffer buffer, int size, String name); /*
@@ -3362,7 +3459,7 @@ public class LuaJitNatives implements LuaNatives {
      * Resume a coroutine
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param nargs the number of arguments that you pushed onto the stack
      * @return see description
      */
@@ -3398,7 +3495,7 @@ public class LuaJitNatives implements LuaNatives {
      * Push a Java class
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param clazz the Java class
      */
     public native void luaJ_pushclass(long ptr, Object clazz); /*
@@ -3415,7 +3512,7 @@ public class LuaJitNatives implements LuaNatives {
      * Push a Java array
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param array the Java array
      */
     public native void luaJ_pusharray(long ptr, Object array); /*
@@ -3432,7 +3529,7 @@ public class LuaJitNatives implements LuaNatives {
      * Push a JFunction
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr  the <code>lua_State*</code> pointer
      * @param func the function object
      */
     public native void luaJ_pushfunction(long ptr, Object func); /*
@@ -3449,7 +3546,7 @@ public class LuaJitNatives implements LuaNatives {
      * Is a Java object (including object, array or class)
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3468,7 +3565,7 @@ public class LuaJitNatives implements LuaNatives {
      * Convert to Java object if it is one
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3525,11 +3622,11 @@ public class LuaJitNatives implements LuaNatives {
      * Parameters should be boxed and pushed on stack.
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
-     * @param clazz the Java class
+     * @param ptr    the <code>lua_State*</code> pointer
+     * @param clazz  the Java class
      * @param method the method name
-     * @param sig the method signature used in {@code GetMethodID}
-     * @param obj the Java object
+     * @param sig    the method signature used in {@code GetMethodID}
+     * @param obj    the Java object
      * @param params encoded parameter types
      * @return see description
      */
@@ -3548,7 +3645,7 @@ public class LuaJitNatives implements LuaNatives {
      * See <code>lua_isinteger</code>
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3617,7 +3714,7 @@ public class LuaJitNatives implements LuaNatives {
      * See <code>lua_tolstring</code>
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
@@ -3636,7 +3733,7 @@ public class LuaJitNatives implements LuaNatives {
      * See <code>lua_tolstring</code>
      * </p>
      *
-     * @param ptr the <code>lua_State*</code> pointer
+     * @param ptr   the <code>lua_State*</code> pointer
      * @param index the stack position of the element
      * @return see description
      */
